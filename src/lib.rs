@@ -1,77 +1,133 @@
-// These two generate a lot of false positives for Bevy systems
-#![allow(clippy::too_many_arguments, clippy::type_complexity)]
-// This is not a library, so we don't need to worry about intra-doc links
-#![allow(rustdoc::private_intra_doc_links)]
-
-//! Foxtrot is split into many plugins with their own set of responsibilities.
-//! This is an organizational measure and not meant to be imply that you can turn them on or off at will,
-//! since the plugins are interdependent.  
-//! Instead, decide for yourself which features you like and which one's you don't and simply trim the code accordingly.
-//! Feel free to [file an issue](https://github.com/janhohenheim/foxtrot/issues/new) if you need help!
-//! The docs are organized such that you can click through the plugins to explore the systems at play.
-
-use bevy::prelude::*;
-mod bevy_config;
+mod animation;
+mod asset_tracking;
+mod audio;
+mod character;
+mod collision_layer;
+mod cursor;
 #[cfg(feature = "dev")]
-mod dev;
-mod file_system_interaction;
-mod ingame_menu;
-mod level_instantiation;
-mod menu;
-pub(crate) mod movement;
-pub(crate) mod particles;
-mod player_control;
-mod shader;
+mod dev_tools;
+mod dialog;
+mod hacks;
+mod level;
+mod player;
+mod screens;
 mod system_set;
-pub(crate) mod util;
-mod world_interaction;
+mod theme;
+mod ui_camera;
 
-pub(crate) use system_set::GameSystemSet;
+use avian3d::{prelude::SyncPlugin, sync::SyncConfig, PhysicsPlugins};
+use avian_interpolation3d::prelude::*;
+use bevy::{
+    asset::AssetMetaCheck,
+    audio::{AudioPlugin, Volume},
+    log::LogPlugin,
+    prelude::*,
+};
+use bevy_tweening::TweeningPlugin;
+use blenvy::BlenvyPlugin;
+use sickle_ui::SickleUiPlugin;
 
-#[derive(States, Default, Clone, Eq, PartialEq, Debug, Hash)]
-enum GameState {
-    /// During the loading State the loading_plugin will load our assets
-    #[default]
-    Loading,
-    /// During this State the actual game logic is executed
-    Playing,
-    /// Here the menu is drawn and waiting for player interaction
-    Menu,
+pub struct AppPlugin;
+
+impl Plugin for AppPlugin {
+    fn build(&self, app: &mut App) {
+        // Order new `AppStep` variants by adding them here:
+        app.configure_sets(
+            Update,
+            (AppSet::TickTimers, AppSet::RecordInput, AppSet::Update).chain(),
+        );
+
+        // Spawn the main camera.
+        app.add_systems(Startup, spawn_camera);
+
+        // Add Bevy plugins.
+        app.add_plugins(
+            DefaultPlugins
+                .set(AssetPlugin {
+                    // Wasm builds will check for meta files (that don't exist) if this isn't set.
+                    // This causes errors and even panics on web build on itch.
+                    // See https://github.com/bevyengine/bevy_github_ci_template/issues/48.
+                    meta_check: AssetMetaCheck::Never,
+                    ..default()
+                })
+                .set(WindowPlugin {
+                    primary_window: Window {
+                        title: "Foxtrot".to_string(),
+                        canvas: Some("#bevy".to_string()),
+                        fit_canvas_to_parent: true,
+                        prevent_default_event_handling: true,
+                        ..default()
+                    }
+                    .into(),
+                    ..default()
+                })
+                .set(AudioPlugin {
+                    global_volume: GlobalVolume {
+                        volume: Volume::new(0.3),
+                    },
+                    ..default()
+                })
+                .set(LogPlugin {
+                    // - Blenvy's alpha currently logs debug messages under the info level, so we disable that in general.
+                    // - The ronstring_to_reflect_component is reporting a warning for `components_meta`, which is exported by mistake.
+                    // - avian3d::prepare is reporting that dynamic rigid bodies are lacking mass, which is because it takes a while for the
+                    //   underlying blueprint to finish loading.
+                    filter: "\
+                        blenvy=warn,\
+                        blenvy::components::ronstring_to_reflect_component=error,\
+                        avian3d::prepare=error\
+                    "
+                    .to_string(),
+                    ..default()
+                }),
+        );
+
+        // Add third party plugins.
+        app.init_resource::<SyncConfig>();
+        app.add_plugins((
+            BlenvyPlugin::default(),
+            PhysicsPlugins::default().build().disable::<SyncPlugin>(),
+            AvianInterpolationPlugin::default(),
+            SickleUiPlugin,
+            TweeningPlugin,
+        ));
+
+        // Add internal plugins.
+        app.add_plugins((
+            asset_tracking::plugin,
+            animation::plugin,
+            player::plugin,
+            level::plugin,
+            screens::plugin,
+            theme::plugin,
+            collision_layer::plugin,
+            ui_camera::plugin,
+            character::plugin,
+            system_set::plugin,
+            hacks::plugin,
+            cursor::plugin,
+            dialog::plugin,
+        ));
+
+        // Enable dev tools for dev builds.
+        #[cfg(feature = "dev")]
+        app.add_plugins(dev_tools::plugin);
+    }
 }
 
-/// Main entrypoint for Foxtrot.
-///
-/// The top-level plugins are:
-/// - [`system_set::plugin`]: Sets up the system set used to order systems across Foxtrot.
-/// - [`bevy_config::plugin`]: Sets up the bevy configuration.
-/// - [`menu::plugin`]: Handles the menu.
-/// - [`movement::plugin`]: Handles the movement of entities.
-/// - [`player_control::plugin`]: Handles the player's control.
-/// - [`world_interaction::plugin`]: Handles the interaction of entities with the world.
-/// - [`level_instantiation::plugin`]: Handles the creation of levels and objects.
-/// - [`file_system_interaction::plugin`]: Handles the loading and saving of games.
-/// - [`shader::plugin`]: Handles the shaders.
-/// - [`dev::plugin`]: Handles the dev tools.
-/// - [`ingame_menu::plugin`]: Handles the ingame menu accessed via ESC.
-/// - [`particles::plugin`]: Handles the particle system.
-pub struct GamePlugin;
+/// High-level groupings of systems for the app in the `Update` schedule.
+/// When adding a new variant, make sure to order it in the `configure_sets`
+/// call above.
+#[derive(SystemSet, Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
+enum AppSet {
+    /// Tick timers.
+    TickTimers,
+    /// Record player input.
+    RecordInput,
+    /// Do everything else (consider splitting this into further variants).
+    Update,
+}
 
-impl Plugin for GamePlugin {
-    fn build(&self, app: &mut App) {
-        app.init_state::<GameState>().add_plugins((
-            system_set::plugin,
-            bevy_config::plugin,
-            menu::plugin,
-            movement::plugin,
-            player_control::plugin,
-            world_interaction::plugin,
-            level_instantiation::plugin,
-            file_system_interaction::plugin,
-            shader::plugin,
-            ingame_menu::plugin,
-            particles::plugin,
-            #[cfg(feature = "dev")]
-            dev::plugin,
-        ));
-    }
+fn spawn_camera(mut commands: Commands) {
+    commands.add(ui_camera::spawn_ui_camera);
 }
